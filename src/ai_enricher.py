@@ -124,6 +124,9 @@ def enrich_excel(
     model: str,
     dry_run: bool = False,
     write_mode: str = "new",
+    only_nos: List[str] | None = None,
+    only_rows: List[int] | None = None,
+    include_completed: bool = False,
 ) -> Dict[str, Any]:
     df = pd.read_excel(input_path, dtype=str)
     df = df.fillna("")
@@ -137,8 +140,19 @@ def enrich_excel(
 
     for pos, (_, row) in tqdm(enumerate(df.iterrows()), total=len(df), desc="Evaluating"):
         status = str(row.get("ステータス", "")).strip()
-        if status == "完了":
+        if (not include_completed) and status == "完了":
             continue
+        excel_row = pos + 2
+
+        # Apply filters if provided
+        if only_nos is not None:
+            no_val = str(row.get("No.", "")).strip()
+            if no_val not in set(only_nos):
+                continue
+        if only_rows is not None:
+            if excel_row not in set(only_rows):
+                continue
+
         task = _row_to_task(row)
         if dry_run:
             result = {
@@ -152,10 +166,8 @@ def enrich_excel(
         else:
             result = client.evaluate_task(task)  # type: ignore[union-attr]
 
-        # Map to Excel row number (header is row 1)
-        excel_row = pos + 2
+        # Map to Excel row number (already computed)
         results_by_row[excel_row] = result
-
         # For JSON export, include No. for traceability
         results.append({"No.": task.get("No.", ""), **result})
 
@@ -188,6 +200,23 @@ def main() -> None:
         default="new",
         help="出力方法: new=同名時は連番で新規作成, overwrite=指定出力に上書き。--output未指定かつoverwriteの場合は入力ファイルに上書き",
     )
+    parser.add_argument(
+        "--only-no",
+        type=str,
+        default="",
+        help="処理対象にするNo.をカンマ区切りで指定 (例: 1,3,5)。未指定で全行(完了は除外)。",
+    )
+    parser.add_argument(
+        "--only-rows",
+        type=str,
+        default="",
+        help="処理対象にするExcel行番号をカンマ/ハイフンで指定 (例: 2,4-6)。ヘッダは1行目。",
+    )
+    parser.add_argument(
+        "--include-completed",
+        action="store_true",
+        help="ステータス=完了の行も処理対象に含める",
+    )
 
     args = parser.parse_args()
 
@@ -201,6 +230,43 @@ def main() -> None:
 
     json_path = None if str(args.json) == "" else args.json
 
+    # Parse filters
+    def _parse_no_list(s: str) -> List[str] | None:
+        s = (s or "").strip()
+        if not s:
+            return None
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    def _parse_row_spec(s: str) -> List[int] | None:
+        s = (s or "").strip()
+        if not s:
+            return None
+        res: list[int] = []
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    a, b = part.split("-", 1)
+                    start = int(a)
+                    end = int(b)
+                    if start <= end:
+                        res.extend(range(start, end + 1))
+                    else:
+                        res.extend(range(end, start + 1))
+                except Exception:
+                    continue
+            else:
+                try:
+                    res.append(int(part))
+                except Exception:
+                    continue
+        return sorted(set(res)) or None
+
+    only_nos = _parse_no_list(args.only_no)
+    only_rows = _parse_row_spec(args.only_rows)
+
     info = enrich_excel(
         input_path=args.input,
         output_path=output_path,
@@ -208,6 +274,9 @@ def main() -> None:
         model=args.model,
         dry_run=args.dry_run,
         write_mode=args.write_mode,
+        only_nos=only_nos,
+        only_rows=only_rows,
+        include_completed=args.include_completed,
     )
 
     print(json.dumps(info, ensure_ascii=False))
